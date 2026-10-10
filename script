@@ -1,0 +1,443 @@
+-- ============================================
+-- Candy2026 自動撿取 v11
+-- v9 自動撿取 + 反掛機(融合 evxncodes anti-afk) + 計時器/FPS/Ping
+-- ============================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local VirtualUser = game:GetService("VirtualUser")
+local Stats = game:GetService("Stats")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local rootPart = character:WaitForChild("HumanoidRootPart")
+
+-- ========== 設定 ==========
+local TELEPORT_OFFSET_Y  = 2
+local SCAN_INTERVAL      = 0.25
+local COOLDOWN           = 0.15
+local VISIT_TIMEOUT      = 3
+
+-- 反掛機設定
+local ANTI_IDLE_ENABLED  = true
+local ANTI_IDLE_INTERVAL = 60      -- 每 60 秒主動觸發一次 (Roblox 預設 20 分鐘踢)
+
+-- ========== 狀態 ==========
+local running = false
+local collectCount = 0
+local lastScan = 0
+local lastTp = 0
+local visited = {}
+
+-- 計時器
+local startTime = nil
+local elapsed = 0
+
+-- 反掛機
+local lastAntiIdle = 0
+local antiIdleCount = 0
+
+-- FPS 計算
+local fpsFrameCount = 0
+local fpsLastTime = tick()
+local currentFPS = 0
+
+-- Ping
+local currentPing = 0
+
+-- ========== Remote ==========
+local candy = ReplicatedStorage:FindFirstChild("Candy2026")
+local remote = candy and candy:FindFirstChild("Remote")
+if not remote then warn("[AutoPick] ❌ 找不到 Remote"); return end
+print("[AutoPick] ✅ Remote:", remote:GetFullName())
+
+-- ============================================
+-- 反掛機 (融合 evxncodes 的做法: CaptureController + ClickButton2)
+-- ============================================
+local function doAntiIdle()
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+    antiIdleCount += 1
+    if _G.__updateAntiIdle then
+        _G.__updateAntiIdle(antiIdleCount)
+    end
+    print(string.format("[AutoPick] 🛡 反掛機觸發 #%d", antiIdleCount))
+end
+
+-- 監聽 Roblox 原生 Idled 事件 (被判定掛機時觸發)
+player.Idled:Connect(function()
+    print("[AutoPick] ⚠ 被系統判定掛機, 觸發反制...")
+    doAntiIdle()
+    task.wait(1)
+    doAntiIdle()
+end)
+
+-- ============================================
+-- 找糖果資料夾
+-- ============================================
+local function getCandyFolder()
+    return workspace:FindFirstChild("LocalCandy2026")
+end
+
+local candyFolder = getCandyFolder()
+if candyFolder then
+    print("[AutoPick] ✅ 找到 LocalCandy2026")
+else
+    warn("[AutoPick] ⚠ 找不到 LocalCandy2026, 等它出現...")
+end
+
+-- ============================================
+-- 工具函式
+-- ============================================
+local function getPos(obj)
+    if obj:IsA("BasePart") then return obj.Position end
+    if obj:IsA("Model") then
+        local p = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+        return p and p.Position or nil
+    end
+    return nil
+end
+
+local function teleportTo(pos)
+    if not rootPart or not rootPart.Parent then
+        character = player.Character
+        if not character then return false end
+        rootPart = character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then return false end
+    end
+
+    local now = os.clock()
+    if now - lastTp < COOLDOWN then return false end
+    lastTp = now
+
+    rootPart.CFrame = CFrame.new(pos + Vector3.new(0, TELEPORT_OFFSET_Y, 0))
+    rootPart.AssemblyLinearVelocity = Vector3.zero
+    rootPart.AssemblyAngularVelocity = Vector3.zero
+    return true
+end
+
+local function formatTime(sec)
+    sec = math.floor(sec)
+    local h = math.floor(sec / 3600)
+    local m = math.floor((sec % 3600) / 60)
+    local s = sec % 60
+    return string.format("%02d:%02d:%02d", h, m, s)
+end
+
+-- ============================================
+-- 主循環
+-- ============================================
+RunService.Heartbeat:Connect(function()
+    -- FPS 計算
+    fpsFrameCount += 1
+    local now = tick()
+    if now - fpsLastTime >= 1 then
+        currentFPS = fpsFrameCount
+        fpsFrameCount = 0
+        fpsLastTime = now
+        if _G.__updateFPS then _G.__updateFPS(currentFPS) end
+    end
+
+    -- Ping (每秒更新)
+    pcall(function()
+        local ps = Stats:FindFirstChild("PerformanceStats")
+        if ps and ps:FindFirstChild("Ping") then
+            currentPing = math.floor(tonumber(ps.Ping:GetValue()) or 0)
+        end
+    end)
+
+    if not running then return end
+    now = os.clock()
+
+    -- 更新運行時間
+    if startTime then
+        elapsed = now - startTime
+        if _G.__updateTimer then _G.__updateTimer(formatTime(elapsed)) end
+    end
+
+    -- 反掛機定時觸發 (主動)
+    if ANTI_IDLE_ENABLED and (now - lastAntiIdle) >= ANTI_IDLE_INTERVAL then
+        lastAntiIdle = now
+        doAntiIdle()
+    end
+
+    -- 掃描 & 傳送
+    if now - lastScan < SCAN_INTERVAL then return end
+    lastScan = now
+
+    if not rootPart or not rootPart.Parent then
+        rootPart = character and character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then return end
+    end
+
+    if not candyFolder or not candyFolder.Parent then
+        candyFolder = getCandyFolder()
+        if not candyFolder then return end
+    end
+
+    local myPos = rootPart.Position
+    local closest, closestDist, closestName = nil, math.huge, nil
+
+    for _, obj in ipairs(candyFolder:GetChildren()) do
+        if obj:IsA("Model") then
+            local pos = getPos(obj)
+            if pos then
+                local d = (pos - myPos).Magnitude
+                if d < closestDist then
+                    closest, closestDist, closestName = pos, d, obj.Name
+                end
+            end
+        end
+    end
+
+    if closest then
+        local key = string.format("%.0f_%.0f_%.0f", closest.X, closest.Y, closest.Z)
+        local lastVisit = visited[key]
+        if lastVisit and (now - lastVisit) < VISIT_TIMEOUT then
+            return
+        end
+
+        if teleportTo(closest) then
+            visited[key] = now
+            collectCount += 1
+            if _G.__updateCount then _G.__updateCount(collectCount) end
+            print(string.format("[AutoPick] 🚀 傳送 #%d → %s (距離 %.1f)",
+                collectCount, closestName, closestDist))
+        end
+    end
+end)
+
+-- ============================================
+-- 監聽事件 (清 visited 表示有新糖果)
+-- ============================================
+remote.OnClientEvent:Connect(function(...)
+    local args = {...}
+    if args[1] == "Add" then
+        visited = {}
+        print("[AutoPick] ✨ Add → 清空 visited")
+    end
+end)
+
+-- ============================================
+-- 控制
+-- ============================================
+local function startAuto()
+    running = true
+    collectCount = 0
+    visited = {}
+    startTime = os.clock()
+    lastAntiIdle = os.clock()
+    antiIdleCount = 0
+    print("[AutoPick] ▶ 已啟動 (計時開始)")
+end
+
+local function stopAuto()
+    running = false
+    print(string.format("[AutoPick] ⛔ 已停止 (運行 %s)", formatTime(elapsed)))
+end
+
+-- ============================================
+-- UI
+-- ============================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "AutoPickCandy"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 260, 0, 270)
+frame.Position = UDim2.new(0, 20, 0, 100)
+frame.BackgroundColor3 = Color3.fromRGB(28, 28, 34)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+frame.Parent = gui
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+local stroke = Instance.new("UIStroke", frame)
+stroke.Color = Color3.fromRGB(90, 90, 110)
+stroke.Thickness = 1
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, 0, 0, 32)
+title.BackgroundTransparency = 1
+title.Text = "🍬 自動撿取 v11"
+title.TextColor3 = Color3.fromRGB(255, 220, 120)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+
+-- 狀態
+local status = Instance.new("TextLabel", frame)
+status.Size = UDim2.new(1, -20, 0, 22)
+status.Position = UDim2.new(0, 10, 0, 36)
+status.BackgroundTransparency = 1
+status.Text = "狀態: 已停止 ⛔"
+status.TextColor3 = Color3.fromRGB(200, 200, 200)
+status.Font = Enum.Font.Gotham
+status.TextSize = 13
+status.TextXAlignment = Enum.TextXAlignment.Left
+
+-- 計時器
+local timerLabel = Instance.new("TextLabel", frame)
+timerLabel.Size = UDim2.new(1, -20, 0, 22)
+timerLabel.Position = UDim2.new(0, 10, 0, 58)
+timerLabel.BackgroundTransparency = 1
+timerLabel.Text = "⏱ 運行時間: 00:00:00"
+timerLabel.TextColor3 = Color3.fromRGB(120, 200, 255)
+timerLabel.Font = Enum.Font.GothamBold
+timerLabel.TextSize = 13
+timerLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- 已傳送
+local countLabel = Instance.new("TextLabel", frame)
+countLabel.Size = UDim2.new(1, -20, 0, 20)
+countLabel.Position = UDim2.new(0, 10, 0, 82)
+countLabel.BackgroundTransparency = 1
+countLabel.Text = "已傳送: 0"
+countLabel.TextColor3 = Color3.fromRGB(150, 200, 150)
+countLabel.Font = Enum.Font.Gotham
+countLabel.TextSize = 12
+countLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- 反掛機狀態
+local antiIdleLabel = Instance.new("TextLabel", frame)
+antiIdleLabel.Size = UDim2.new(1, -20, 0, 20)
+antiIdleLabel.Position = UDim2.new(0, 10, 0, 104)
+antiIdleLabel.BackgroundTransparency = 1
+antiIdleLabel.Text = "🛡 反掛機: 待機中"
+antiIdleLabel.TextColor3 = Color3.fromRGB(200, 200, 100)
+antiIdleLabel.Font = Enum.Font.Gotham
+antiIdleLabel.TextSize = 12
+antiIdleLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- FPS
+local fpsLabel = Instance.new("TextLabel", frame)
+fpsLabel.Size = UDim2.new(0.5, -10, 0, 20)
+fpsLabel.Position = UDim2.new(0, 10, 0, 126)
+fpsLabel.BackgroundTransparency = 1
+fpsLabel.Text = "FPS: 60"
+fpsLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+fpsLabel.Font = Enum.Font.Gotham
+fpsLabel.TextSize = 12
+fpsLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- Ping
+local pingLabel = Instance.new("TextLabel", frame)
+pingLabel.Size = UDim2.new(0.5, -10, 0, 20)
+pingLabel.Position = UDim2.new(0.5, 0, 0, 126)
+pingLabel.BackgroundTransparency = 1
+pingLabel.Text = "Ping: 0 ms"
+pingLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+pingLabel.Font = Enum.Font.Gotham
+pingLabel.TextSize = 12
+pingLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+-- 全域更新函式
+_G.__updateCount = function(n)
+    countLabel.Text = "已傳送: " .. tostring(n)
+end
+
+_G.__updateTimer = function(str)
+    timerLabel.Text = "⏱ 運行時間: " .. str
+end
+
+_G.__updateAntiIdle = function(n)
+    antiIdleLabel.Text = string.format("🛡 反掛機: 已觸發 %d 次", n)
+    antiIdleLabel.TextColor3 = Color3.fromRGB(120, 230, 120)
+    task.delay(3, function()
+        antiIdleLabel.TextColor3 = Color3.fromRGB(200, 200, 100)
+    end)
+end
+
+_G.__updateFPS = function(fps)
+    fpsLabel.Text = "FPS: " .. tostring(fps)
+    -- 顏色根據 FPS 變化
+    if fps >= 50 then
+        fpsLabel.TextColor3 = Color3.fromRGB(120, 230, 120)
+    elseif fps >= 30 then
+        fpsLabel.TextColor3 = Color3.fromRGB(255, 220, 120)
+    else
+        fpsLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+    end
+end
+
+-- 更新 Ping (每秒)
+task.spawn(function()
+    while true do
+        task.wait(1)
+        pingLabel.Text = "Ping: " .. tostring(currentPing) .. " ms"
+        if currentPing <= 80 then
+            pingLabel.TextColor3 = Color3.fromRGB(120, 230, 120)
+        elseif currentPing <= 150 then
+            pingLabel.TextColor3 = Color3.fromRGB(255, 220, 120)
+        else
+            pingLabel.TextColor3 = Color3.fromRGB(255, 120, 120)
+        end
+    end
+end)
+
+-- 按鈕
+local startBtn = Instance.new("TextButton", frame)
+startBtn.Size = UDim2.new(0.44, 0, 0, 40)
+startBtn.Position = UDim2.new(0.04, 0, 0, 155)
+startBtn.BackgroundColor3 = Color3.fromRGB(46, 165, 70)
+startBtn.Text = "▶ 開始"
+startBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+startBtn.Font = Enum.Font.GothamBold
+startBtn.TextSize = 15
+Instance.new("UICorner", startBtn).CornerRadius = UDim.new(0, 6)
+
+local stopBtn = Instance.new("TextButton", frame)
+stopBtn.Size = UDim2.new(0.44, 0, 0, 40)
+stopBtn.Position = UDim2.new(0.52, 0, 0, 155)
+stopBtn.BackgroundColor3 = Color3.fromRGB(205, 55, 55)
+stopBtn.Text = "■ 停止"
+stopBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+stopBtn.Font = Enum.Font.GothamBold
+stopBtn.TextSize = 15
+Instance.new("UICorner", stopBtn).CornerRadius = UDim.new(0, 6)
+
+-- 重置計時器
+local resetBtn = Instance.new("TextButton", frame)
+resetBtn.Size = UDim2.new(1, -20, 0, 24)
+resetBtn.Position = UDim2.new(0, 10, 0, 205)
+resetBtn.BackgroundColor3 = Color3.fromRGB(60, 60, 80)
+resetBtn.Text = "↻ 重置計時器"
+resetBtn.TextColor3 = Color3.fromRGB(220, 220, 220)
+resetBtn.Font = Enum.Font.Gotham
+resetBtn.TextSize = 12
+Instance.new("UICorner", resetBtn).CornerRadius = UDim.new(0, 5)
+
+-- 事件綁定
+startBtn.MouseButton1Click:Connect(function()
+    startAuto()
+    status.Text = "狀態: 運行中 ✅"
+    status.TextColor3 = Color3.fromRGB(120, 230, 120)
+    countLabel.Text = "已傳送: 0"
+    timerLabel.Text = "⏱ 運行時間: 00:00:00"
+end)
+
+stopBtn.MouseButton1Click:Connect(function()
+    stopAuto()
+    status.Text = "狀態: 已停止 ⛔"
+    status.TextColor3 = Color3.fromRGB(200, 200, 200)
+end)
+
+resetBtn.MouseButton1Click:Connect(function()
+    if running then
+        startTime = os.clock()
+        elapsed = 0
+        timerLabel.Text = "⏱ 運行時間: 00:00:00"
+        print("[AutoPick] ↻ 計時器已重置")
+    end
+end)
+
+player.CharacterAdded:Connect(function(c)
+    character = c
+    rootPart = c:WaitForChild("HumanoidRootPart", 10)
+end)
+
+print("[AutoPick] v11 已載入 ✅ (反掛機 + 計時器 + FPS/Ping)")
